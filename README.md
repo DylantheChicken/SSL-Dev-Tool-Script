@@ -105,9 +105,17 @@ Containers ship their own trust store, so none of the host configuration above r
 | `Dockerfile.build-arg` | Installs the CA only when built with `--build-arg BUILD_ENV=development` |
 | `docker-compose.netskope.yml` + `netskope.env` | Compose wiring for the build-arg variant |
 | `install-netskope-ca-in-container.sh` / `.ps1` | Patches containers that are already running |
+| `trust-netskope-ca-in-docker-daemon.sh` | Makes the Docker **daemon** trust the CA (pulls, pushes, builds) |
 | `README.md` | The same guidance, next to the files |
 
 The script also offers to run the injector against the containers running at that moment.
+
+### Two separate problems
+
+The daemon and the containers fail independently, and fixing one does not fix the other:
+
+- **The daemon** does its own TLS to the registry, so `docker pull` can fail with `x509: certificate signed by unknown authority` before any container exists. `trust-netskope-ca-in-docker-daemon.sh` (Linux, needs `sudo`) fixes this two ways: with no arguments it installs into the host OS trust store, which covers every registry including Docker Hub but needs a daemon restart; given registry names it writes `/etc/docker/certs.d/<registry>/ca.crt`, which takes effect on the next pull with no restart but only for those registries. Docker Desktop on macOS/Windows uses neither path — add the CA to the host keychain or Windows certificate store and restart Docker Desktop.
+- **The containers** need the CA in their own trust store, which is what the Dockerfile assets and the injector handle.
 
 - **Baking beats patching.** `docker cp` into a running container is undone the moment the container is recreated; the Dockerfile route survives.
 - **Trust-store layout is detected per container** — `/usr/local/share/ca-certificates` + `update-ca-certificates` (Debian/Ubuntu/Alpine), `/etc/pki/ca-trust/source/anchors` + `update-ca-trust` (RHEL family), or `/etc/pki/trust/anchors` (SUSE). Minimal images that ship the merged bundle but no `update-ca-certificates` (most Alpine-based ones) get the CA appended to `/etc/ssl/certs/ca-certificates.crt` instead, marked so re-runs are idempotent.

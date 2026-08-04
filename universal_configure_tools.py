@@ -469,10 +469,15 @@ Pick whichever of these matches how the project builds:
 | `Dockerfile.build-arg` | Installs the CA only when `--build-arg BUILD_ENV=development` |
 | `docker-compose.netskope.yml` + `netskope.env` | Compose wiring for the build-arg variant |
 | `install-netskope-ca-in-container.*` | Patch containers that are already running |
+| `trust-netskope-ca-in-docker-daemon.sh` | Make the Docker daemon itself trust the CA (pulls, pushes, builds) |
 | `netskope-ca.crt` | The CA itself - must be in the build context |
 
 Baking the CA into the image is the durable option; `docker cp` into a running container is
 undone the moment the container is recreated.
+
+The daemon is a separate problem from the containers: it does its own TLS to the registry,
+so `docker pull` can fail with `x509: certificate signed by unknown authority` before any
+container exists. That is what the daemon script fixes.
 
 Verify from inside a container with `curl -fsS https://www.google.com -o /dev/null` -
 success means the resigned certificate is trusted.
@@ -537,6 +542,62 @@ for c in $targets; do
     echo "[warn] $c: failed to install the Netskope CA"
   fi
 done
+"""
+
+DOCKER_DAEMON_SH = """\
+#!/bin/sh
+## Makes the Docker *daemon* trust the Netskope CA, so image pulls, pushes and builds
+## succeed behind SSL inspection. This is separate from the CA inside containers - the
+## daemon does its own TLS to the registry. Linux hosts only; run with sudo.
+##
+##   sudo ./trust-netskope-ca-in-docker-daemon.sh
+##       Install into the host OS trust store. Covers every registry, including Docker
+##       Hub. Requires a daemon restart afterwards.
+##
+##   sudo ./trust-netskope-ca-in-docker-daemon.sh myreg.example.com:5000 ...
+##       Install per-registry under /etc/docker/certs.d. Takes effect on the next pull
+##       with no daemon restart, but only for the registries named. The directory name
+##       must match the registry exactly as it appears in the image reference, port
+##       included.
+##
+## Docker Desktop (macOS / Windows) uses neither path: add the CA to the host keychain
+## or Windows certificate store, then restart Docker Desktop.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ca="$here/netskope-ca.crt"
+[ -f "$ca" ] || { echo "Error: netskope-ca.crt not found next to this script" >&2; exit 1; }
+[ "$(uname -s)" = Linux ] || { echo "Error: Linux hosts only (see the Docker Desktop note above)" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "Error: run this with sudo" >&2; exit 1; }
+
+if [ "$#" -gt 0 ]; then
+  for reg in "$@"; do
+    dir="/etc/docker/certs.d/$reg"
+    mkdir -p "$dir"
+    cp "$ca" "$dir/ca.crt"
+    chmod 644 "$dir/ca.crt"
+    echo "[ok]   $reg: $dir/ca.crt"
+  done
+  echo "Takes effect on the next pull or push - no daemon restart needed."
+  exit 0
+fi
+
+if [ -d /usr/local/share/ca-certificates ]; then
+  dir=/usr/local/share/ca-certificates; update='update-ca-certificates'
+elif [ -d /etc/pki/ca-trust/source/anchors ]; then
+  dir=/etc/pki/ca-trust/source/anchors; update='update-ca-trust extract'
+elif [ -d /etc/pki/trust/anchors ]; then
+  dir=/etc/pki/trust/anchors; update='update-ca-certificates'
+else
+  echo "Error: no CA trust directory found on this host" >&2
+  exit 1
+fi
+
+cp "$ca" "$dir/netskope-ca.crt"
+chmod 644 "$dir/netskope-ca.crt"
+$update
+echo "[ok]   Netskope CA installed in $dir"
+echo "Restart the Docker daemon to pick it up, e.g. sudo systemctl restart docker"
 """
 
 DOCKER_INJECTOR_PS1 = """\
@@ -649,6 +710,7 @@ def write_docker_assets():
     write_asset(docker_dir / "netskope.env", DOCKER_ENV)
     write_asset(docker_dir / "README.md", DOCKER_README)
     write_asset(docker_dir / "install-netskope-ca-in-container.sh", DOCKER_INJECTOR_SH, executable=True)
+    write_asset(docker_dir / "trust-netskope-ca-in-docker-daemon.sh", DOCKER_DAEMON_SH, executable=True)
     if IS_WINDOWS:
         write_asset(docker_dir / "install-netskope-ca-in-container.ps1", DOCKER_INJECTOR_PS1)
 
