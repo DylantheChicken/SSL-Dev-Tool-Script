@@ -92,6 +92,12 @@ cert_dir.mkdir(parents=True, exist_ok=True)
 bundle_path = cert_dir / cert_name
 configured_tools_file = cert_dir / ("configured_tools.bat" if IS_WINDOWS else "configured_tools.sh")
 
+# Netskope-only certs, split out of the full bundle. Container trust stores already ship the
+# Mozilla roots, so what they need is just the Netskope CA chain — and OS trust-store tools
+# (update-ca-certificates / update-ca-trust) only pick up files with a .crt extension.
+netskope_ca_path = cert_dir / "netskope-ca.crt"
+docker_dir = cert_dir / "docker"
+
 # --- Local client cert detection ---
 use_local_certs = False
 if NS_CA_CERT and NS_CA_CERT.exists() and NS_TENANT_CERT.exists():
@@ -199,6 +205,11 @@ def build_bundle():
         print("Netskope certificates added from local client")
     else:
         parts.append(fetch_api_certs())
+
+    # Everything gathered so far is Netskope-only; keep a copy before the Mozilla roots land.
+    netskope_ca_path.write_bytes(b"".join(parts))
+    os.chmod(netskope_ca_path, 0o644)
+
     parts.append(fetch_mozilla_bundle())
 
     bundle_path.write_bytes(b"".join(parts))
@@ -325,6 +336,466 @@ else:
         else:
             set_env_var(v, cert_path)
             print(f"  {v} configured")
+
+# --- Docker -----------------------------------------------------------------
+# Containers carry their own trust store, so nothing configured above reaches them. The
+# Netskope guidance ("Install the Netskope Certificates on the Docker machines that require
+# Internet access") covers three deployment styles — patch a running container, bake the CA
+# into an image, or gate it on a build arg for compose — and we can't know which one a given
+# project uses, so emit ready-to-use assets for all three.
+#
+# The OS trust store alone is also not enough: Node, Python requests, pip, Cargo and Git each
+# carry their own CA list, hence the ENV block in the generated Dockerfiles.
+
+DOCKERFILE_SNIPPET = """\
+# --- Netskope SSL inspection trust ------------------------------------------
+# Paste into your Dockerfile after the base image's package manager is usable.
+# Requires netskope-ca.crt in the build context (copy it next to your Dockerfile).
+
+# Debian / Ubuntu / Alpine (needs the ca-certificates package - most Alpine images ship
+# only ca-certificates-bundle, so add `RUN apk add --no-cache ca-certificates` first):
+COPY netskope-ca.crt /usr/local/share/ca-certificates/netskope-ca.crt
+RUN chmod 644 /usr/local/share/ca-certificates/netskope-ca.crt && update-ca-certificates
+
+# RHEL / CentOS / Fedora / Amazon Linux - use instead:
+#   COPY netskope-ca.crt /etc/pki/ca-trust/source/anchors/netskope-ca.crt
+#   RUN chmod 644 /etc/pki/ca-trust/source/anchors/netskope-ca.crt && update-ca-trust extract
+#
+# openSUSE / SLES - use instead:
+#   COPY netskope-ca.crt /etc/pki/trust/anchors/netskope-ca.crt
+#   RUN chmod 644 /etc/pki/trust/anchors/netskope-ca.crt && update-ca-certificates
+
+# The OS trust store does not cover runtimes that ship their own CA list.
+# Debian/Ubuntu/Alpine merged-bundle path:
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \\
+    NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/netskope-ca.crt \\
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \\
+    CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \\
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt \\
+    GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \\
+    CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
+# On RHEL-family images the merged bundle lives at /etc/pki/tls/certs/ca-bundle.crt -
+# substitute that path above, and point NODE_EXTRA_CA_CERTS at the anchors copy.
+# ---------------------------------------------------------------------------
+"""
+
+DOCKERFILE_EXAMPLE = """\
+# Standalone example: Debian/Ubuntu base image that trusts the Netskope CA.
+# Build from this directory so netskope-ca.crt is in the build context:
+#   docker build -f Dockerfile.example -t ubuntu-netskope .
+FROM ubuntu
+
+RUN apt-get update -y \\
+ && apt-get install -y --no-install-recommends ca-certificates curl wget \\
+ && rm -rf /var/lib/apt/lists/*
+
+# Install the Netskope CA into the OS trust store
+COPY netskope-ca.crt /usr/local/share/ca-certificates/netskope-ca.crt
+RUN chmod 644 /usr/local/share/ca-certificates/netskope-ca.crt && update-ca-certificates
+
+# Runtimes that ignore the OS trust store
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \\
+    NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/netskope-ca.crt \\
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \\
+    CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \\
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt \\
+    GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt \\
+    CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
+
+# Verify at build time (optional): RUN curl -fsS https://www.google.com -o /dev/null
+"""
+
+DOCKERFILE_BUILD_ARG = """\
+# Conditional variant for Dockerfiles shared across environments: the CA is installed only
+# when BUILD_ENV=development, so images built in CI (no SSL inspection) stay untouched.
+#   docker build --build-arg BUILD_ENV=development -f Dockerfile.build-arg -t myimage .
+FROM ubuntu
+
+RUN apt-get update -y \\
+ && apt-get install -y --no-install-recommends ca-certificates curl wget \\
+ && rm -rf /var/lib/apt/lists/*
+
+ARG BUILD_ENV
+ARG CERT_DIR=/usr/local/share/ca-certificates
+ENV BUILD_ENV=$BUILD_ENV
+
+COPY netskope-ca.crt /tmp/netskope-ca.crt
+RUN if [ "$BUILD_ENV" = "development" ]; then \\
+        cp /tmp/netskope-ca.crt "$CERT_DIR/netskope-ca.crt" && \\
+        chmod 644 "$CERT_DIR/netskope-ca.crt" && \\
+        update-ca-certificates; \\
+    fi; \\
+    rm -f /tmp/netskope-ca.crt
+
+# Harmless when the CA was not installed - these paths exist in any ca-certificates image.
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \\
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \\
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \\
+    CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+"""
+
+DOCKER_COMPOSE = """\
+# Compose fragment pairing with Dockerfile.build-arg. Put BUILD_ENV=development in a .env
+# file next to your compose file (see netskope.env) to switch CA installation on; omit the
+# file, or set any other value, to build without the Netskope CA.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.build-arg
+      args:
+        BUILD_ENV: ${BUILD_ENV}
+    environment:
+      - BUILD_ENV=${BUILD_ENV}
+    stdin_open: true
+    tty: true
+"""
+
+DOCKER_ENV = """\
+# Copy to ".env" next to your docker-compose file to enable CA installation at build time.
+BUILD_ENV=development
+"""
+
+DOCKER_README = """\
+# Netskope certificates for Docker
+
+Containers ship their own trust store, so the host configuration does not reach them.
+Pick whichever of these matches how the project builds:
+
+| File | Use |
+| --- | --- |
+| `Dockerfile.snippet` | Lines to paste into an existing Dockerfile |
+| `Dockerfile.example` | Standalone Debian/Ubuntu image that trusts the CA |
+| `Dockerfile.build-arg` | Installs the CA only when `--build-arg BUILD_ENV=development` |
+| `docker-compose.netskope.yml` + `netskope.env` | Compose wiring for the build-arg variant |
+| `install-netskope-ca-in-container.*` | Patch containers that are already running |
+| `trust-netskope-ca-in-docker-daemon.sh` | Make the Docker daemon itself trust the CA (pulls, pushes, builds) |
+| `netskope-ca.crt` | The CA itself - must be in the build context |
+
+Baking the CA into the image is the durable option; `docker cp` into a running container is
+undone the moment the container is recreated.
+
+The daemon is a separate problem from the containers: it does its own TLS to the registry,
+so `docker pull` can fail with `x509: certificate signed by unknown authority` before any
+container exists. That is what the daemon script fixes.
+
+Verify from inside a container with `curl -fsS https://www.google.com -o /dev/null` -
+success means the resigned certificate is trusted.
+"""
+
+DOCKER_INJECTOR_SH = """\
+#!/bin/sh
+## Installs the Netskope CA into running Docker containers.
+##
+##   ./install-netskope-ca-in-container.sh              # all running containers
+##   ./install-netskope-ca-in-container.sh <id|name>... # specific containers
+##
+## Changes are lost when a container is recreated - bake the CA into the image
+## (see Dockerfile.snippet) for anything longer-lived than a one-off test.
+set -eu
+
+marker='# Netskope CA (install-netskope-ca-in-container)'
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ca="$here/netskope-ca.crt"
+[ -f "$ca" ] || { echo "Error: netskope-ca.crt not found next to this script" >&2; exit 1; }
+
+if [ "$#" -gt 0 ]; then
+  targets=$*
+else
+  targets=$(docker ps --format '{{.Names}}')
+  [ -n "$targets" ] || { echo "No running containers."; exit 0; }
+fi
+
+for c in $targets; do
+  if docker exec "$c" test -d /usr/local/share/ca-certificates 2>/dev/null; then
+    dir=/usr/local/share/ca-certificates; update='update-ca-certificates'
+  elif docker exec "$c" test -d /etc/pki/ca-trust/source/anchors 2>/dev/null; then
+    dir=/etc/pki/ca-trust/source/anchors; update='update-ca-trust extract'
+  elif docker exec "$c" test -d /etc/pki/trust/anchors 2>/dev/null; then
+    dir=/etc/pki/trust/anchors; update='update-ca-certificates'
+  else
+    dir=''; update=''
+  fi
+
+  if [ -n "$dir" ]; then
+    if docker cp "$ca" "$c:$dir/netskope-ca.crt" >/dev/null 2>&1 \\
+       && docker exec "$c" chmod 644 "$dir/netskope-ca.crt" >/dev/null 2>&1 \\
+       && docker exec "$c" sh -c "$update" >/dev/null 2>&1; then
+      echo "[ok]   $c: Netskope CA installed ($dir)"
+    else
+      echo "[warn] $c: failed to install the Netskope CA"
+    fi
+    continue
+  fi
+
+  # Minimal images (most Alpine-based ones) ship the merged bundle but no anchors directory
+  # and no update-ca-certificates. Appending to the bundle is what OpenSSL and cURL read.
+  bundle=/etc/ssl/certs/ca-certificates.crt
+  if ! docker exec "$c" test -f "$bundle" 2>/dev/null; then
+    echo "[skip] $c: no CA trust store found (install the ca-certificates package)"
+  elif docker exec "$c" grep -qF "$marker" "$bundle" 2>/dev/null; then
+    echo "[ok]   $c: Netskope CA already present in $bundle"
+  elif docker cp "$ca" "$c:/tmp/netskope-ca.crt" >/dev/null 2>&1 \\
+       && docker exec "$c" sh -c "echo '' >> $bundle && echo '$marker' >> $bundle && cat /tmp/netskope-ca.crt >> $bundle && rm -f /tmp/netskope-ca.crt" >/dev/null 2>&1; then
+    echo "[ok]   $c: Netskope CA appended to $bundle"
+  else
+    echo "[warn] $c: failed to install the Netskope CA"
+  fi
+done
+"""
+
+DOCKER_DAEMON_SH = """\
+#!/bin/sh
+## Makes the Docker *daemon* trust the Netskope CA, so image pulls, pushes and builds
+## succeed behind SSL inspection. This is separate from the CA inside containers - the
+## daemon does its own TLS to the registry. Linux hosts only; run with sudo.
+##
+##   sudo ./trust-netskope-ca-in-docker-daemon.sh
+##       Install into the host OS trust store. Covers every registry, including Docker
+##       Hub. Requires a daemon restart afterwards.
+##
+##   sudo ./trust-netskope-ca-in-docker-daemon.sh myreg.example.com:5000 ...
+##       Install per-registry under /etc/docker/certs.d. Takes effect on the next pull
+##       with no daemon restart, but only for the registries named. The directory name
+##       must match the registry exactly as it appears in the image reference, port
+##       included.
+##
+## Docker Desktop (macOS / Windows) uses neither path: add the CA to the host keychain
+## or Windows certificate store, then restart Docker Desktop.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ca="$here/netskope-ca.crt"
+[ -f "$ca" ] || { echo "Error: netskope-ca.crt not found next to this script" >&2; exit 1; }
+[ "$(uname -s)" = Linux ] || { echo "Error: Linux hosts only (see the Docker Desktop note above)" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || { echo "Error: run this with sudo" >&2; exit 1; }
+
+if [ "$#" -gt 0 ]; then
+  for reg in "$@"; do
+    dir="/etc/docker/certs.d/$reg"
+    mkdir -p "$dir"
+    cp "$ca" "$dir/ca.crt"
+    chmod 644 "$dir/ca.crt"
+    echo "[ok]   $reg: $dir/ca.crt"
+  done
+  echo "Takes effect on the next pull or push - no daemon restart needed."
+  exit 0
+fi
+
+if [ -d /usr/local/share/ca-certificates ]; then
+  dir=/usr/local/share/ca-certificates; update='update-ca-certificates'
+elif [ -d /etc/pki/ca-trust/source/anchors ]; then
+  dir=/etc/pki/ca-trust/source/anchors; update='update-ca-trust extract'
+elif [ -d /etc/pki/trust/anchors ]; then
+  dir=/etc/pki/trust/anchors; update='update-ca-certificates'
+else
+  echo "Error: no CA trust directory found on this host" >&2
+  exit 1
+fi
+
+cp "$ca" "$dir/netskope-ca.crt"
+chmod 644 "$dir/netskope-ca.crt"
+$update
+echo "[ok]   Netskope CA installed in $dir"
+echo "Restart the Docker daemon to pick it up, e.g. sudo systemctl restart docker"
+"""
+
+DOCKER_INJECTOR_PS1 = """\
+<#
+.SYNOPSIS
+    Installs the Netskope CA into running Docker containers.
+.DESCRIPTION
+    Pass container names/IDs, or none to patch every running container. Changes are lost
+    when a container is recreated - bake the CA into the image (see Dockerfile.snippet)
+    for anything longer-lived than a one-off test.
+#>
+param([string[]]$Containers)
+
+$ErrorActionPreference = 'Stop'
+$marker = '# Netskope CA (install-netskope-ca-in-container)'
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ca   = Join-Path $here 'netskope-ca.crt'
+if (-not (Test-Path $ca)) { Write-Error 'netskope-ca.crt not found next to this script'; exit 1 }
+
+if (-not $Containers) {
+    $Containers = @(& docker ps --format '{{.Names}}' 2>$null | Where-Object { $_ })
+    if (-not $Containers) { Write-Host 'No running containers.'; exit 0 }
+}
+
+# Ordered so the first directory that exists wins, matching the .sh variant.
+$layouts = @(
+    @{ Dir = '/usr/local/share/ca-certificates'; Update = 'update-ca-certificates' }
+    @{ Dir = '/etc/pki/ca-trust/source/anchors'; Update = 'update-ca-trust extract' }
+    @{ Dir = '/etc/pki/trust/anchors';           Update = 'update-ca-certificates' }
+)
+
+foreach ($c in $Containers) {
+    $layout = $null
+    foreach ($l in $layouts) {
+        & docker exec $c test -d $l.Dir 2>$null
+        if ($LASTEXITCODE -eq 0) { $layout = $l; break }
+    }
+    if ($layout) {
+        $target = "$($layout.Dir)/netskope-ca.crt"
+        & docker cp $ca "${c}:$target" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) { & docker exec $c chmod 644 $target 2>$null | Out-Null }
+        if ($LASTEXITCODE -eq 0) { & docker exec $c sh -c $layout.Update 2>$null | Out-Null }
+
+        if ($LASTEXITCODE -eq 0) { Write-Host "[ok]   ${c}: Netskope CA installed ($($layout.Dir))" }
+        else                     { Write-Host "[warn] ${c}: failed to install the Netskope CA" }
+        continue
+    }
+
+    # Minimal images (most Alpine-based ones) ship the merged bundle but no anchors directory
+    # and no update-ca-certificates. Appending to the bundle is what OpenSSL and cURL read.
+    $bundle = '/etc/ssl/certs/ca-certificates.crt'
+    & docker exec $c test -f $bundle 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[skip] ${c}: no CA trust store found (install the ca-certificates package)"
+        continue
+    }
+    & docker exec $c grep -qF $marker $bundle 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "[ok]   ${c}: Netskope CA already present in $bundle"
+        continue
+    }
+    & docker cp $ca "${c}:/tmp/netskope-ca.crt" 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        & docker exec $c sh -c "echo '' >> $bundle && echo '$marker' >> $bundle && cat /tmp/netskope-ca.crt >> $bundle && rm -f /tmp/netskope-ca.crt" 2>$null | Out-Null
+    }
+    if ($LASTEXITCODE -eq 0) { Write-Host "[ok]   ${c}: Netskope CA appended to $bundle" }
+    else                     { Write-Host "[warn] ${c}: failed to install the Netskope CA" }
+}
+"""
+
+# Fallback for minimal images with no anchors directory: the merged bundle every OpenSSL
+# build reads, plus a marker line that makes re-runs idempotent (text outside the
+# BEGIN/END CERTIFICATE delimiters is ignored by OpenSSL).
+CONTAINER_MERGED_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+CONTAINER_CA_MARKER = "# Netskope CA (install-netskope-ca-in-container)"
+
+# Ordered so the first directory that exists wins.
+CONTAINER_TRUST_LAYOUTS = (
+    ("/usr/local/share/ca-certificates", "update-ca-certificates"),
+    ("/etc/pki/ca-trust/source/anchors", "update-ca-trust extract"),
+    ("/etc/pki/trust/anchors", "update-ca-certificates"),
+)
+
+
+def write_asset(path, text, executable=False):
+    """Write with LF endings — these files are consumed inside Linux containers, where the
+    CRLF that text mode would produce on Windows breaks shebangs and RUN lines."""
+    with open(path, "w", newline="\n") as f:
+        f.write(text)
+    if executable and not IS_WINDOWS:
+        os.chmod(path, 0o755)
+
+
+def write_docker_assets():
+    docker_dir.mkdir(parents=True, exist_ok=True)
+
+    # The CA that goes *into* containers. Prefer the Netskope-only chain; fall back to the
+    # full bundle when the user reused a bundle built before this split existed.
+    ca_source = netskope_ca_path
+    if not (netskope_ca_path.exists() and netskope_ca_path.stat().st_size):
+        ca_source = bundle_path
+        print("  Warning: netskope-ca.crt not found — using the full bundle (includes Mozilla roots).")
+        print("           Recreate the bundle to get a Netskope-only netskope-ca.crt.")
+    shutil.copy2(ca_source, docker_dir / "netskope-ca.crt")
+
+    write_asset(docker_dir / "Dockerfile.snippet", DOCKERFILE_SNIPPET)
+    write_asset(docker_dir / "Dockerfile.example", DOCKERFILE_EXAMPLE)
+    write_asset(docker_dir / "Dockerfile.build-arg", DOCKERFILE_BUILD_ARG)
+    write_asset(docker_dir / "docker-compose.netskope.yml", DOCKER_COMPOSE)
+    write_asset(docker_dir / "netskope.env", DOCKER_ENV)
+    write_asset(docker_dir / "README.md", DOCKER_README)
+    write_asset(docker_dir / "install-netskope-ca-in-container.sh", DOCKER_INJECTOR_SH, executable=True)
+    write_asset(docker_dir / "trust-netskope-ca-in-docker-daemon.sh", DOCKER_DAEMON_SH, executable=True)
+    if IS_WINDOWS:
+        write_asset(docker_dir / "install-netskope-ca-in-container.ps1", DOCKER_INJECTOR_PS1)
+
+
+def running_containers():
+    """Names of running containers, or [] when the daemon is unreachable."""
+    try:
+        out = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [n for n in out.stdout.splitlines() if n.strip()]
+
+
+def install_ca_in_container(name, ca_file):
+    def run(args):
+        return subprocess.run(
+            ["docker", *args], capture_output=True, text=True, timeout=120
+        ).returncode == 0
+
+    layout = next(
+        ((d, u) for d, u in CONTAINER_TRUST_LAYOUTS if run(["exec", name, "test", "-d", d])),
+        None,
+    )
+    if layout is not None:
+        trust_dir, update_cmd = layout
+        target = f"{trust_dir}/netskope-ca.crt"
+        ok = (
+            run(["cp", str(ca_file), f"{name}:{target}"])
+            and run(["exec", name, "chmod", "644", target])
+            and run(["exec", name, "sh", "-c", update_cmd])
+        )
+        print(f"  [ok]   {name}: Netskope CA installed ({trust_dir})" if ok
+              else f"  [warn] {name}: failed to install the Netskope CA")
+        return
+
+    # Minimal images (most Alpine-based ones) ship the merged bundle but no anchors directory
+    # and no update-ca-certificates. Appending to the bundle is what OpenSSL and cURL read.
+    if not run(["exec", name, "test", "-f", CONTAINER_MERGED_BUNDLE]):
+        print(f"  [skip] {name}: no CA trust store found (install the ca-certificates package)")
+    elif run(["exec", name, "grep", "-qF", CONTAINER_CA_MARKER, CONTAINER_MERGED_BUNDLE]):
+        print(f"  [ok]   {name}: Netskope CA already present in {CONTAINER_MERGED_BUNDLE}")
+    elif run(["cp", str(ca_file), f"{name}:/tmp/netskope-ca.crt"]) and run([
+        "exec", name, "sh", "-c",
+        f"echo '' >> {CONTAINER_MERGED_BUNDLE}"
+        f" && echo '{CONTAINER_CA_MARKER}' >> {CONTAINER_MERGED_BUNDLE}"
+        f" && cat /tmp/netskope-ca.crt >> {CONTAINER_MERGED_BUNDLE}"
+        f" && rm -f /tmp/netskope-ca.crt",
+    ]):
+        print(f"  [ok]   {name}: Netskope CA appended to {CONTAINER_MERGED_BUNDLE}")
+    else:
+        print(f"  [warn] {name}: failed to install the Netskope CA")
+
+
+print()
+if not command_exists("docker"):
+    print("Docker is not installed")
+else:
+    print("Docker is installed")
+    write_docker_assets()
+    print(f"Docker build assets written: {docker_dir}")
+
+    containers = running_containers()
+    if not containers:
+        print("No running containers to patch (or the Docker daemon is not reachable)")
+    else:
+        print("Running containers:")
+        for c in containers:
+            print(f"  {c}")
+        if input("Install the Netskope CA into these running containers now? (y/N) ").strip().lower() == "y":
+            for c in containers:
+                install_ca_in_container(c, docker_dir / "netskope-ca.crt")
+            print("Note: container changes are lost on recreate — bake the CA in via Dockerfile.snippet")
+        else:
+            print("Running containers left unchanged")
+
+    injector = "install-netskope-ca-in-container.ps1" if IS_WINDOWS else "install-netskope-ca-in-container.sh"
+    comment = "::" if IS_WINDOWS else "#"
+    append_tools_file(f"{comment} Netskope Docker assets: {docker_dir} (see its README.md)")
+    append_tools_file(f"{comment} Patch running containers: {docker_dir / injector}")
+
 
 # --- Azure Storage Explorer ---
 print()
