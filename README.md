@@ -8,10 +8,11 @@ Cross-platform scripts that detect popular CLI tools, libraries, and desktop app
 
 Each script:
 
-1. Builds a CA bundle at `<certDir>/<certName>` containing the Netskope tenant CA + the Mozilla root bundle (from `curl.se`).
+1. Builds a CA bundle at `<certDir>/<certName>` containing the Netskope tenant CA + the Mozilla root bundle (from `curl.se`), plus `<certDir>/netskope-ca.crt` holding just the Netskope chain.
 2. Detects which supported tools are installed.
 3. For each tool, sets the appropriate env var or runs the tool's config command.
-4. Writes a replay script (`configured_tools.sh` / `configured_tools.bat`) alongside the bundle for silent deployment to other machines.
+4. If Docker is present, writes ready-to-use container assets to `<certDir>/docker/` (see [Docker](#docker)).
+5. Writes a replay script (`configured_tools.sh` / `configured_tools.bat`) alongside the bundle for silent deployment to other machines.
 
 ## Scripts
 
@@ -88,8 +89,31 @@ Where a tool honors an environment variable, the script exports it in the user's
 | Azure Storage Explorer | Copies bundle into the app's `certs/` directory |
 | Claude Desktop | Detect-only — Electron reads `NODE_EXTRA_CA_CERTS` from the user environment at launch (set by `setx` on Windows; macOS GUI apps may need `launchctl setenv`) |
 | VS Code / VS Code Insiders / Cursor | Adds `NODE_EXTRA_CA_CERTS` to `terminal.integrated.env.*` in `settings.json` |
+| Docker | Generates container CA assets in `<certDir>/docker/` and can patch running containers (see [Docker](#docker)) |
 
 Note: Go (`crypto/x509`) picks up `SSL_CERT_FILE` automatically — it's already set by the OpenSSL entry, so there's no separate Go step.
+
+## Docker
+
+Containers ship their own trust store, so none of the host configuration above reaches them — a container behind SSL inspection fails every HTTPS call until the Netskope CA is installed *inside* it. When `docker` is on PATH, each script writes a self-contained `<certDir>/docker/` directory:
+
+| File | Use |
+| --- | --- |
+| `netskope-ca.crt` | The Netskope CA chain only (no Mozilla roots) — must be in the build context |
+| `Dockerfile.snippet` | Lines to paste into an existing Dockerfile |
+| `Dockerfile.example` | Standalone Debian/Ubuntu image that trusts the CA |
+| `Dockerfile.build-arg` | Installs the CA only when built with `--build-arg BUILD_ENV=development` |
+| `docker-compose.netskope.yml` + `netskope.env` | Compose wiring for the build-arg variant |
+| `install-netskope-ca-in-container.sh` / `.ps1` | Patches containers that are already running |
+| `README.md` | The same guidance, next to the files |
+
+The script also offers to run the injector against the containers running at that moment.
+
+- **Baking beats patching.** `docker cp` into a running container is undone the moment the container is recreated; the Dockerfile route survives.
+- **Trust-store layout is detected per container** — `/usr/local/share/ca-certificates` + `update-ca-certificates` (Debian/Ubuntu/Alpine), `/etc/pki/ca-trust/source/anchors` + `update-ca-trust` (RHEL family), or `/etc/pki/trust/anchors` (SUSE). Minimal images that ship the merged bundle but no `update-ca-certificates` (most Alpine-based ones) get the CA appended to `/etc/ssl/certs/ca-certificates.crt` instead, marked so re-runs are idempotent.
+- **The OS trust store is not sufficient on its own.** Node, Python `requests`, pip, Cargo and Git each carry their own CA list, so the generated Dockerfiles also set `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `GIT_SSL_CAINFO` and `CARGO_HTTP_CAINFO`. (Verified: Node rejects a Netskope-signed cert with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` even after `update-ca-certificates`, and accepts it once `NODE_EXTRA_CA_CERTS` is set.)
+- **`.crt`, not `.pem`** — `update-ca-certificates` only picks up files with a `.crt` extension, which is why the container copy is named `netskope-ca.crt`.
+- Generated assets are ASCII with LF line endings and no BOM, so they work unchanged when the bundle is produced on Windows and consumed in a Linux container.
 
 ## Notes
 
