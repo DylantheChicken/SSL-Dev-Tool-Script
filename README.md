@@ -1,6 +1,6 @@
 # ssl-configure-scripts
 
-Cross-platform scripts that detect popular CLI tools, libraries, and desktop apps and point them at a Netskope SSL-inspection certificate bundle.
+Cross-platform scripts that detect popular CLI tools, libraries, and desktop apps and point them at a Netskope SSL-inspection certificate bundle — and, for Docker, generate the assets needed to extend that trust to the daemon and to containers.
 
 > **Origin:** Based on [duduke/ssl-configure-scripts](https://github.com/duduke/ssl-configure-scripts). This fork adds coverage for additional dev tools and switches certificate retrieval to work with **Netskope Secure Enrollment** (tenant API + local STAgent certs) instead of the legacy org-key flow.
 
@@ -30,6 +30,7 @@ If the Netskope client is installed locally, the script will offer to use `nscac
 
 - **macOS / Linux**: `python3`, `curl`, and `openssl` on PATH
 - **Windows**: PowerShell 5.1 (ships with Windows 10+) or PowerShell 7+ (`pwsh`). The Windows path is implemented entirely in PowerShell — no `python3` or `curl` required. The `.cmd` file is a thin launcher that forwards to `configure_tools_windows.ps1`.
+- **Docker** is optional. If `docker` is on PATH the scripts generate the [Docker](#docker) assets; the daemon does not need to be running for that (they skip patching live containers and say so).
 
 ## Usage
 
@@ -45,6 +46,14 @@ chmod +x configure_tools_unix.sh
 ```cmd
 configure_tools_windows.cmd
 ```
+
+### Python (any platform)
+
+```bash
+python3 universal_configure_tools.py
+```
+
+Stdlib only — no `pip install` needed.
 
 ### Prompts
 
@@ -63,6 +72,8 @@ Each run emits a replay script next to the bundle:
 - **Windows**: run `<certDir>\configured_tools.ps1` — re-invokes `configure_tools_windows.ps1` with `-NonInteractive` against the existing bundle (no tenant prompt, no API token required). The main `.ps1` is copied next to the bundle so the deploy folder is self-contained; copy the bundle, `configure_tools_windows.ps1`, and `configured_tools.ps1` to another machine and run the replay script.
 
 Copy the bundle and the replay script to another machine to reproduce the same configuration without re-prompting.
+
+The `<certDir>/docker/` directory is self-contained and travels with the bundle — copy it across and the Dockerfiles, compose fragment and helper scripts work as-is, since each one locates `netskope-ca.crt` next to itself. The replay script records the path to it rather than re-running the container patching, which is deliberate: patching whatever containers happen to be running on the target machine is not something a silent deploy should do unasked.
 
 ## Tools configured
 
@@ -89,13 +100,15 @@ Where a tool honors an environment variable, the script exports it in the user's
 | Azure Storage Explorer | Copies bundle into the app's `certs/` directory |
 | Claude Desktop | Detect-only — Electron reads `NODE_EXTRA_CA_CERTS` from the user environment at launch (set by `setx` on Windows; macOS GUI apps may need `launchctl setenv`) |
 | VS Code / VS Code Insiders / Cursor | Adds `NODE_EXTRA_CA_CERTS` to `terminal.integrated.env.*` in `settings.json` |
-| Docker | Generates container CA assets in `<certDir>/docker/` and can patch running containers (see [Docker](#docker)) |
+| Docker | Generates CA assets in `<certDir>/docker/` for images, the daemon, and running containers; offers to patch live containers (see [Docker](#docker)) |
 
 Note: Go (`crypto/x509`) picks up `SSL_CERT_FILE` automatically — it's already set by the OpenSSL entry, so there's no separate Go step.
 
 ## Docker
 
-Containers ship their own trust store, so none of the host configuration above reaches them — a container behind SSL inspection fails every HTTPS call until the Netskope CA is installed *inside* it. When `docker` is on PATH, each script writes a self-contained `<certDir>/docker/` directory:
+Nothing configured above reaches Docker. Containers ship their own trust store, so a container behind SSL inspection fails every HTTPS call until the CA is installed *inside* it — and the daemon has its own trust path, so `docker pull` can fail before a container even exists.
+
+When `docker` is on PATH, each script writes a self-contained `<certDir>/docker/` directory covering both:
 
 | File | Use |
 | --- | --- |
@@ -117,6 +130,8 @@ The daemon and the containers fail independently, and fixing one does not fix th
 - **The daemon** does its own TLS to the registry, so `docker pull` can fail with `x509: certificate signed by unknown authority` before any container exists. `trust-netskope-ca-in-docker-daemon.sh` (Linux, needs `sudo`) fixes this two ways: with no arguments it installs into the host OS trust store, which covers every registry including Docker Hub but needs a daemon restart; given registry names it writes `/etc/docker/certs.d/<registry>/ca.crt`, which takes effect on the next pull with no restart but only for those registries. Docker Desktop on macOS/Windows uses neither path — add the CA to the host keychain or Windows certificate store and restart Docker Desktop.
 - **The containers** need the CA in their own trust store, which is what the Dockerfile assets and the injector handle.
 
+### How the container install works
+
 - **Baking beats patching.** `docker cp` into a running container is undone the moment the container is recreated; the Dockerfile route survives.
 - **Trust-store layout is detected per container** — `/usr/local/share/ca-certificates` + `update-ca-certificates` (Debian/Ubuntu/Alpine), `/etc/pki/ca-trust/source/anchors` + `update-ca-trust` (RHEL family), or `/etc/pki/trust/anchors` (SUSE). Minimal images that ship the merged bundle but no `update-ca-certificates` (most Alpine-based ones) get the CA appended to `/etc/ssl/certs/ca-certificates.crt` instead, marked so re-runs are idempotent.
 - **The OS trust store is not sufficient on its own.** Node, Python `requests`, pip, Cargo and Git each carry their own CA list, so the generated Dockerfiles also set `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `PIP_CERT`, `GIT_SSL_CAINFO` and `CARGO_HTTP_CAINFO`. (Verified: Node rejects a Netskope-signed cert with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` even after `update-ca-certificates`, and accepts it once `NODE_EXTRA_CA_CERTS` is set.)
@@ -131,14 +146,6 @@ The daemon and the containers fail independently, and fixing one does not fix th
 - **Trust-store download is verified first** — the Mozilla root bundle (`curl.se/ca/cacert.pem`) is fetched with TLS verification enabled and only falls back to an unverified fetch if that fails (i.e. when the host is behind Netskope inspection and the resigned cert isn't trusted yet). A size sanity-check rejects truncated/captive-portal responses before they reach the bundle.
 - **API token stays off the process table** — the Unix script passes the Bearer token to `curl` via a mode-600 `--config` file rather than on the command line, so it isn't visible in `ps` on multi-user hosts.
 - **`REQUESTS_CA_BUNDLE` is shared** — Python Requests and Azure CLI both read it, so setting it once configures both.
-
-### Python (any platform)
-
-```bash
-python3 universal_configure_tools.py
-```
-
-Stdlib only — no `pip install` needed.
 
 ## Other files
 
